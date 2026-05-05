@@ -1,15 +1,57 @@
-require('dotenv').config();
 const puppeteer = require('puppeteer-core');
 const { spawn, exec } = require('child_process');
 const fs = require('fs/promises');
 const util = require('util');
 const execAsync = util.promisify(exec);
 
-const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const CHROME_PROFILE_DIR = process.env.CHROME_PROFILE_DIR || 'C:\\temp\\chrome-dev-profile';
-const DEBUG_PORT = process.env.DEBUG_PORT || 9222;
+const config = require('./config.json');
+
+const CHROME_PATH = config.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+const CHROME_PROFILE_DIR = config.CHROME_PROFILE_DIR || 'C:\\temp\\chrome-dev-profile';
+const DEBUG_PORT = config.DEBUG_PORT || 9222;
+
+const NUM_ACCOUNTS_MULTIPLIER = parseFloat(config.NUM_ACCOUNTS_MULTIPLIER) || 1;
+const LOT_SIZE_MULTIPLIER = parseFloat(config.LOT_SIZE_MULTIPLIER) || 0.01;
+const WHATSAPP_GROUP_ID = config.WHATSAPP_GROUP_ID || "120363426979957217@g.us";
+
+async function sendWhatsAppMessage(message) {
+  try {
+    await fetch('https://deswa.io7.my/api/external/send-message', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ number: WHATSAPP_GROUP_ID, message: message })
+    });
+  } catch(e) {
+    console.error("WhatsApp Error:", e.message);
+  }
+}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Send trade signal to the Python MT5 Bridge
+ */
+async function sendMt5Signal(action, symbol, size, ticket = null) {
+  // Translate TopStep symbol to MT5 symbol
+  let mt5Symbol = symbol;
+  if (symbol === 'GOLD' || symbol === '/GC') {
+    mt5Symbol = 'XAUUSD+'; // Standard gold ticker for most MT5 brokers
+  }
+  
+  try {
+    const res = await fetch('http://127.0.0.1:5000', {
+      method: 'POST',
+      body: JSON.stringify({ action: action.toUpperCase(), symbol: mt5Symbol, size: size, ticket: ticket }),
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const data = await res.json();
+    console.log(`[MT5 Bridge] Response:`, data);
+    return data;
+  } catch (err) {
+    console.error(`[MT5 Bridge] ERROR: Could not connect to Python MT5 bridge. Is mt5_bridge.py running?`);
+    return null;
+  }
+}
 
 function isProcessAlive(pid) {
   try {
@@ -137,6 +179,9 @@ async function connectOrLaunchChrome() {
 }
 
 async function startScraping() {
+  if (config.NOTIFY_TOPSTEP_INIT !== false) {
+    await sendWhatsAppMessage('🟢 TopStepX Scraper Started');
+  }
   try {
     const browser = await connectOrLaunchChrome();
     let pages = await browser.pages();
@@ -158,26 +203,44 @@ async function startScraping() {
       const existingData = await fs.readFile('data.json', 'utf8');
       const parsedData = JSON.parse(existingData);
       parsedData.forEach(pos => {
-        activePositions.set(pos.positionID, { data: pos, missingCount: 0 });
+        // Hydrate map with position data and the persistent MT5 ticket
+        activePositions.set(pos.positionID, { data: pos, missingCount: 0, mt5Ticket: pos.mt5Ticket || null });
       });
       console.log(`Loaded ${activePositions.size} existing positions from data.json`);
     } catch(e) {}
 
-    // 2. Load existing bet log if it exists
-    try {
-      const existingLog = await fs.readFile('bet_log.json', 'utf8');
-      betLog = JSON.parse(existingLog);
-    } catch(e) {}
+    // 2. We don't need to load the bet log into memory anymore since it's just append-only text
 
     let scrapeCount = 0; // Tracks loop iterations for startup grace period
+    let hasBeenOnTopStepX = false;
 
     while (true) {
       try {
         // If the page was closed manually, grab a new one
         if (page.isClosed()) {
           console.warn("Page was closed. Trying to get another open page...");
+          if (hasBeenOnTopStepX && config.NOTIFY_TOPSTEP_DISCONNECT !== false) {
+            sendWhatsAppMessage('⚠️ [ALERT] TopStepX browser tab was closed or crashed!');
+            hasBeenOnTopStepX = false;
+          }
           pages = await browser.pages();
           page = pages.length > 0 ? pages[0] : await browser.newPage();
+        }
+
+        const currentUrl = page.url();
+        if (!currentUrl.includes('topstepx.com')) {
+          if (hasBeenOnTopStepX) {
+            console.warn("Navigated away from TopStepX!");
+            if (config.NOTIFY_TOPSTEP_DISCONNECT !== false) {
+              sendWhatsAppMessage(`⚠️ [ALERT] Browser navigated away from TopStepX! (Now on: ${currentUrl})`);
+            }
+            hasBeenOnTopStepX = false;
+          }
+          console.log(`Waiting for TopStepX website... (Currently on: ${currentUrl})`);
+          await sleep(2000);
+          continue;
+        } else {
+          hasBeenOnTopStepX = true;
         }
 
         // Wait for the table AND its footer to ensure the component is actually rendered
@@ -233,15 +296,26 @@ async function startScraping() {
         for (const pos of positions) {
           if (!activePositions.has(pos.positionID)) {
             // New position detected
-            activePositions.set(pos.positionID, { data: pos, missingCount: 0 });
-            
             let action = pos.positionSize > 0 ? "buy" : "sell";
             let asset = pos.symbolName === "/GC" ? "GOLD" : pos.symbolName;
             let logMsg = `[NEW BET] ${action} ${Math.abs(pos.positionSize)} ${asset} (ID: ${pos.positionID})`;
             
             console.log(">>> " + logMsg);
-            betLog.push({ time: new Date().toISOString(), type: 'OPEN', message: logMsg, positionID: pos.positionID, raw: pos });
-            await fs.writeFile('bet_log.json', JSON.stringify(betLog, null, 2), 'utf8');
+            if (config.NOTIFY_TOPSTEP_TRADE !== false) {
+              sendWhatsAppMessage('🚨 ' + logMsg);
+            }
+            await fs.appendFile('bet_log.txt', `[${new Date().toISOString()}] [OPEN] ${logMsg}\n`, 'utf8');
+
+            // --- SEND TO MT5 ---
+            let finalSize = Math.abs(pos.positionSize) * NUM_ACCOUNTS_MULTIPLIER * LOT_SIZE_MULTIPLIER;
+            const mt5Response = await sendMt5Signal(action, asset, finalSize);
+            
+            let ticket = null;
+            if (mt5Response && mt5Response.success && mt5Response.order) {
+              ticket = mt5Response.order;
+            }
+
+            activePositions.set(pos.positionID, { data: pos, missingCount: 0, mt5Ticket: ticket });
           } else {
             // Position exists, reset missing counter
             let existing = activePositions.get(pos.positionID);
@@ -259,9 +333,20 @@ async function startScraping() {
               if (record.missingCount >= 3) {
                 let logMsg = `[CLOSE SIGNAL] Position disappeared for 3s. Signal to close trade (ID: ${posID})`;
                 console.log(">>> " + logMsg);
-                betLog.push({ time: new Date().toISOString(), type: 'CLOSE_SIGNAL', message: logMsg, positionID: posID });
-                await fs.writeFile('bet_log.json', JSON.stringify(betLog, null, 2), 'utf8');
+                if (config.NOTIFY_TOPSTEP_TRADE !== false) {
+                  sendWhatsAppMessage(`🛑 [CLOSED BET] TopStep Position Closed (ID: ${posID})`);
+                }
+                await fs.appendFile('bet_log.txt', `[${new Date().toISOString()}] [CLOSE] ${logMsg}\n`, 'utf8');
                 
+                // --- SEND TO MT5 ---
+                let asset = record.data.symbolName === "/GC" ? "GOLD" : record.data.symbolName;
+                if (record.mt5Ticket) {
+                  await sendMt5Signal("CLOSE_TICKET", asset, 0, record.mt5Ticket);
+                } else {
+                  console.log(`[MT5 Bridge] Warning: No ticket tracked for TopStep ID ${posID}. Closing all XAUUSD+ instead.`);
+                  await sendMt5Signal("CLOSE", asset, 0);
+                }
+
                 activePositions.delete(posID);
               }
             }
@@ -273,8 +358,12 @@ async function startScraping() {
         console.clear(); 
         console.log(`--- Scraped at ${new Date().toLocaleTimeString()} ---`);
         console.table(positions);
-
-        await fs.writeFile('data.json', JSON.stringify(positions, null, 2), 'utf8');
+        
+        // Save current positions to local JSON (Include mt5Ticket from activePositions)
+        const stateToSave = Array.from(activePositions.values()).map(record => {
+          return { ...record.data, mt5Ticket: record.mt5Ticket };
+        });
+        await fs.writeFile('data.json', JSON.stringify(stateToSave, null, 2), 'utf8');
         await sleep(1000);
         
       } catch (error) {
