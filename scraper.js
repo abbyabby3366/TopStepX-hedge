@@ -185,7 +185,7 @@ async function startScraping() {
   try {
     const browser = await connectOrLaunchChrome();
     let pages = await browser.pages();
-    let page = pages.length > 0 ? pages[0] : await browser.newPage();
+    let page = pages.find(p => p.url().includes('topstepx.com')) || (pages.length > 0 ? pages[0] : await browser.newPage());
 
     if (page) {
       console.log('Switching to target tab...');
@@ -225,10 +225,23 @@ async function startScraping() {
             hasBeenOnTopStepX = false;
           }
           pages = await browser.pages();
-          page = pages.length > 0 ? pages[0] : await browser.newPage();
+          page = pages.find(p => p.url().includes('topstepx.com')) || (pages.length > 0 ? pages[0] : await browser.newPage());
         }
 
-        const currentUrl = page.url();
+        let currentUrl = page.url();
+
+        if (!currentUrl.includes('topstepx.com')) {
+          pages = await browser.pages();
+          let tsPage = pages.find(p => p.url().includes('topstepx.com'));
+          if (tsPage) {
+            page = tsPage;
+            currentUrl = page.url();
+            console.log('Found TopStepX in another tab, switching to it...');
+            await page.bringToFront();
+            await bringChromeToFrontOS();
+          }
+        }
+
         if (!currentUrl.includes('topstepx.com')) {
           if (hasBeenOnTopStepX) {
             console.warn("Navigated away from TopStepX!");
