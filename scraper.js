@@ -214,6 +214,7 @@ async function startScraping() {
     let scrapeCount = 0; // Tracks loop iterations for startup grace period
     let hasBeenOnTopStepX = false;
     let tableMissingStartTime = 0; // Tracks how long the table has been missing
+    let hasNotifiedMissingTable = false;
 
     while (true) {
       try {
@@ -254,10 +255,10 @@ async function startScraping() {
           
           if (tableMissingStartTime === 0) tableMissingStartTime = Date.now();
           else if (Date.now() - tableMissingStartTime > 15000) {
-            if (config.NOTIFY_ERRORS !== false) {
+            if (config.NOTIFY_ERRORS !== false && !hasNotifiedMissingTable) {
               sendWhatsAppMessage(`❌ [ERROR] TopStepX position table not detected for >15s! (Currently on: ${currentUrl})`);
+              hasNotifiedMissingTable = true;
             }
-            tableMissingStartTime = Date.now(); // reset timer to avoid spamming
           }
 
           await sleep(2000);
@@ -271,6 +272,9 @@ async function startScraping() {
         await page.waitForSelector('.MuiDataGrid-footerContainer', { timeout: 5000 });
         
         tableMissingStartTime = 0; // Reset missing timer because table was successfully found!
+        if (hasNotifiedMissingTable) {
+          hasNotifiedMissingTable = false; // Reset the notification flag
+        }
 
         scrapeCount++;
 
@@ -396,10 +400,10 @@ async function startScraping() {
         
         if (tableMissingStartTime === 0) tableMissingStartTime = Date.now();
         else if (Date.now() - tableMissingStartTime > 15000) {
-          if (config.NOTIFY_ERRORS !== false) {
+          if (config.NOTIFY_ERRORS !== false && !hasNotifiedMissingTable) {
             sendWhatsAppMessage('❌ [ERROR] TopStepX position table has not been detected for over 15 seconds!');
+            hasNotifiedMissingTable = true;
           }
-          tableMissingStartTime = Date.now(); // reset timer to avoid spamming
         }
         
         await sleep(2000);
