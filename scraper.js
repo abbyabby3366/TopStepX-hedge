@@ -10,8 +10,20 @@ const CHROME_PATH = config.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Ap
 const CHROME_PROFILE_DIR = config.CHROME_PROFILE_DIR || 'C:\\temp\\chrome-dev-profile';
 const DEBUG_PORT = config.DEBUG_PORT || 9222;
 
-const NUM_ACCOUNTS_MULTIPLIER = parseFloat(config.NUM_ACCOUNTS_MULTIPLIER) || 1;
-const LOT_SIZE_MULTIPLIER = parseFloat(config.LOT_SIZE_MULTIPLIER) || 0.01;
+// Read multipliers dynamically from config.json on each trade
+async function getLiveMultipliers() {
+  try {
+    const raw = await fs.readFile('./config.json', 'utf8');
+    const liveConfig = JSON.parse(raw);
+    return {
+      numAccounts: parseFloat(liveConfig.NUM_ACCOUNTS_MULTIPLIER) || 1,
+      lotSize: parseFloat(liveConfig.LOT_SIZE_MULTIPLIER) || 0.01,
+    };
+  } catch (e) {
+    console.warn('[Config] Failed to read live config, using defaults:', e.message);
+    return { numAccounts: 1, lotSize: 0.01 };
+  }
+}
 const WHATSAPP_GROUP_ID = config.WHATSAPP_GROUP_ID || "120363426979957217@g.us";
 
 async function sendWhatsAppMessage(message) {
@@ -336,7 +348,9 @@ async function startScraping() {
             await fs.appendFile('bet_log.txt', `[${new Date().toISOString()}] [OPEN] ${logMsg}\n`, 'utf8');
 
             // --- SEND TO MT5 ---
-            let finalSize = Math.abs(pos.positionSize) * NUM_ACCOUNTS_MULTIPLIER * LOT_SIZE_MULTIPLIER;
+            const { numAccounts, lotSize } = await getLiveMultipliers();
+            let finalSize = Math.abs(pos.positionSize) * numAccounts * lotSize;
+            console.log(`[Config] Live multipliers: accounts=${numAccounts}, lotSize=${lotSize}, finalSize=${finalSize}`);
             const mt5Response = await sendMt5Signal(action, asset, finalSize);
             
             let ticket = null;
